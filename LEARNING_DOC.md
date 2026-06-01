@@ -17,7 +17,12 @@
 9. [权限系统](#9-权限系统)
 10. [TUI 实现](#10-tui-实现)
 11. [MCP 集成](#11-mcp-集成)
-12. [简历技术要点](#12-简历技术要点)
+12. [Agent Intelligence](#12-agent-intelligence) ← 新增
+13. [MCP 集成实现](#13-mcp-集成实现) ← 新增
+14. [权限系统实现](#14-权限系统实现) ← 新增
+15. [TUI 渲染器实现](#15-tui-渲染器实现) ← 新增
+16. [核心工具实现示例](#16-核心工具实现示例) ← 新增
+17. [简历技术要点](#17-简历技术要点)
 
 ---
 
@@ -1805,6 +1810,592 @@ class MCPClient:
 
 ---
 
+## 13. Agent Intelligence（智能增强）
+
+### 13.1 错误分类器 (ErrorClassifier)
+
+```python
+class ErrorClassifier:
+    """将错误输出分类为可处理的类型，支持针对性恢复"""
+    
+    ERROR_PATTERNS = {
+        "SYNTAX_ERROR": [
+            r"SyntaxError:",
+            r"ParseError:",
+            r"IndentationError:",
+            r"TabError:",
+        ],
+        "NAME_ERROR": [
+            r"NameError:",
+            r"undefined name '",
+            r"cannot access",
+        ],
+        "IMPORT_ERROR": [
+            r"ImportError:",
+            r"ModuleNotFoundError:",
+            r"No module named",
+        ],
+        "TYPE_ERROR": [
+            r"TypeError:",
+            r"unsupported operand",
+            r"cannot unpack",
+        ],
+        "FILE_NOT_FOUND": [
+            r"FileNotFoundError:",
+            r"No such file or directory",
+            r"ENOENT",
+        ],
+        "PERMISSION_ERROR": [
+            r"PermissionError:",
+            r"Access denied",
+            r"EACCES",
+        ],
+        "NETWORK_ERROR": [
+            r"ConnectionError:",
+            r"Timeout:",
+            r"HTTP Error",
+            r"Max retries exceeded",
+        ],
+        "RATE_LIMIT_ERROR": [
+            r"rate_limit",
+            r"429",
+            r"too many requests",
+            r"quota exceeded",
+        ],
+        "AUTH_ERROR": [
+            r"401",
+            r"403",
+            r"AuthenticationError",
+            r"Invalid API key",
+        ],
+        "CONTEXT_OVERFLOW": [
+            r"context_length_exceeded",
+            r"maximum context length",
+            r"too many tokens",
+        ],
+        "TOOL_ERROR": [
+            r"Tool execution failed",
+            r"tool error",
+            r"execution error",
+        ],
+    }
+    
+    @classmethod
+    def classify(cls, error_output: str, tool_name: str = "") -> str:
+        """根据错误模式匹配分类"""
+        for error_type, patterns in cls.ERROR_PATTERNS.items():
+            if error_type == "UNKNOWN":
+                continue
+            for pattern in patterns:
+                if re.search(pattern, error_output, re.IGNORECASE):
+                    return error_type
+        return "UNKNOWN"
+```
+
+### 13.2 Nudge 生成器 (NudgeGenerator)
+
+```python
+class NudgeGenerator:
+    """生成帮助模型从错误中恢复的提示"""
+    
+    NUDGE_TEMPLATES = {
+        "SYNTAX_ERROR": [
+            "Fix the syntax error. Check for matching parentheses, quotes, and brackets.",
+            "Review the code structure. Common issues: missing colons, incorrect indentation.",
+        ],
+        "NAME_ERROR": [
+            "The variable or function name is undefined. Check for typos or missing imports.",
+            "Make sure all references are defined before use.",
+        ],
+        "IMPORT_ERROR": [
+            "The module is not installed or not in PYTHONPATH. Try installing it.",
+            "Verify the package name is correct and the package is installed.",
+        ],
+        "TYPE_ERROR": [
+            "Check the types of variables. Operations may be on incompatible types.",
+        ],
+        "FILE_NOT_FOUND": [
+            "The file path may be incorrect. Check if the file exists.",
+        ],
+        "RATE_LIMIT_ERROR": [
+            "Rate limit hit. Wait a moment before retrying.",
+        ],
+    }
+    
+    # 重试次数对应的额外提示
+    RETRY_NUDGES = {
+        1: "First attempt. Try a different approach if you have one.",
+        2: "Second attempt. Consider what changed since the last try.",
+        3: "Final attempt. Summarize the issue and ask for clarification.",
+    }
+    
+    @classmethod
+    def generate(cls, error_type: str, retry_count: int = 0) -> str:
+        """生成恢复提示"""
+        templates = cls.NUDGE_TEMPLATES.get(error_type, 
+            ["Analyze the error and fix the issue."])
+        
+        import random
+        nudge = random.choice(templates)
+        
+        if retry_count in cls.RETRY_NUDGES:
+            nudge += " " + cls.RETRY_NUDGES[retry_count]
+        
+        return nudge
+```
+
+### 13.3 工具调度器 (ToolScheduler)
+
+```python
+class ToolScheduler:
+    """智能调度工具执行顺序，最大化并发"""
+    
+    def __init__(self, metrics_collector: AgentMetricsCollector | None = None):
+        self.metrics = metrics_collector
+        self._conflict_matrix: dict[str, set[str]] = {}
+    
+    def schedule_calls(
+        self, 
+        calls: list[dict], 
+        tools: ToolRegistry
+    ) -> tuple[list[dict], list[dict]]:
+        """将工具调用分为并发安全和串行两组"""
+        concurrent: list[dict] = []
+        serial: list[dict] = []
+        
+        for call in calls:
+            tool_def = tools.find(call["toolName"])
+            
+            if tool_def and tool_def.is_concurrency_safe:
+                # 检查冲突
+                has_conflict = any(
+                    self._check_conflict(call["toolName"], selected["toolName"])
+                    for selected in concurrent
+                )
+                if not has_conflict:
+                    concurrent.append(call)
+                    continue
+            
+            serial.append(call)
+        
+        return concurrent, serial
+    
+    def _check_conflict(self, tool_a: str, tool_b: str) -> bool:
+        """检查两个工具是否冲突"""
+        return (tool_a, tool_b) in [
+            ("edit_file", "edit_file"),
+            ("write_file", "write_file"),
+            ("run_command", "run_command"),
+        ] or (tool_b, tool_a) in [
+            ("edit_file", "edit_file"),
+            ("write_file", "write_file"),
+        ]
+    
+    def record_conflict(self, tool_a: str, tool_b: str) -> None:
+        """记录工具冲突用于学习"""
+        if tool_a not in self._conflict_matrix:
+            self._conflict_matrix[tool_a] = set()
+        if tool_b not in self._conflict_matrix:
+            self._conflict_matrix[tool_b] = set()
+        self._conflict_matrix[tool_a].add(tool_b)
+        self._conflict_matrix[tool_b].add(tool_a)
+```
+
+---
+
+## 14. MCP 集成实现
+
+### 14.1 安全验证层
+
+```python
+# 传输方式白名单
+_ALLOWED_TRANSPORTS = frozenset({"stdio", "sse", "http", "websocket"})
+
+# 命令白名单（防止命令注入）
+_ALLOWED_COMMANDS = frozenset({
+    "npx", "npm", "node", "uvx", "python", "pip",
+    "deno", "bun", "sh", "bash"
+})
+
+# 路径遍历防护
+def _validate_path(path: str, allowed_dir: str) -> bool:
+    """防止 ../ 路径遍历攻击"""
+    resolved = Path(path).resolve()
+    allowed = Path(allowed_dir).resolve()
+    return str(resolved).startswith(str(allowed))
+
+# 负载大小限制（防止 DoS）
+_MAX_PAYLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+
+# 请求超时
+_REQUEST_TIMEOUT = 60  # 秒
+```
+
+### 14.2 MCP 工具创建
+
+```python
+def _create_mcp_tool(
+    server_name: str,
+    tool_schema: dict[str, Any],
+    executor: Callable,
+) -> ToolDefinition:
+    """将 MCP 工具 schema 转换为 ToolDefinition"""
+    
+    name = f"mcp_{server_name}_{tool_schema['name']}"
+    
+    def validator(input_data: Any) -> Any:
+        """验证输入参数"""
+        if 'inputSchema' in tool_schema:
+            required = tool_schema['inputSchema'].get('required', [])
+            for field in required:
+                if field not in input_data:
+                    raise ValueError(f"Missing required field: {field}")
+        return input_data
+    
+    def run(input_data: Any, context: ToolContext) -> ToolResult:
+        """执行 MCP 工具调用"""
+        try:
+            with timeout(_REQUEST_TIMEOUT):
+                result = executor(tool_schema['name'], input_data)
+            
+            if len(str(result)) > _MAX_PAYLOAD_SIZE:
+                return ToolResult(ok=True, output="Result truncated (exceeded 50MB)")
+            
+            return ToolResult(ok=True, output=str(result))
+        
+        except TimeoutError:
+            return ToolResult(ok=False, output="Request timed out after 60s")
+        except Exception as e:
+            return ToolResult(ok=False, output=f"MCP error: {e}")
+    
+    return ToolDefinition(
+        name=name,
+        description=tool_schema.get('description', ''),
+        input_schema=tool_schema.get('inputSchema', {}),
+        validator=validator,
+        run=run,
+        metadata=ToolMetadata(
+            name=name,
+            description=tool_schema.get('description', ''),
+            capabilities={ToolCapability.REQUIRES_PERMISSION},
+        )
+    )
+```
+
+---
+
+## 15. 权限系统实现
+
+### 15.1 路径规范化（安全核心）
+
+```python
+_PATH_CACHE: dict[str, str] = {}  # LRU 缓存
+_PATH_CACHE_MAX = 512
+
+def _normalize_path(path: str, cwd: str) -> str:
+    """规范化路径并缓存结果"""
+    cache_key = f"{cwd}:{path}"
+    if cache_key in _PATH_CACHE:
+        return _PATH_CACHE[cache_key]
+    
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(cwd) / p
+    
+    try:
+        p = p.resolve()
+    except (OSError, RuntimeError):
+        pass
+    
+    result = str(p)
+    
+    if len(_PATH_CACHE) < _PATH_CACHE_MAX:
+        _PATH_CACHE[cache_key] = result
+    
+    return result
+
+def _is_path_safe(path: str, cwd: str) -> bool:
+    """检查路径是否在允许范围内"""
+    normalized = _normalize_path(path, cwd)
+    cwd_normalized = _normalize_path(cwd, cwd)
+    
+    if not normalized.startswith(cwd_normalized):
+        return False
+    
+    try:
+        real_path = Path(path).resolve()
+        real_cwd = Path(cwd).resolve()
+        if not str(real_path).startswith(str(real_cwd)):
+            return False
+    except (OSError, RuntimeError):
+        pass
+    
+    return True
+```
+
+### 15.2 命令白名单验证
+
+```python
+_COMMAND_WHITELIST = frozenset({
+    # 文件操作
+    "ls", "cat", "head", "tail", "grep", "find", "wc", "sort", "uniq",
+    "mkdir", "touch", "cp", "mv", "rm", "chmod", "chown",
+    # Git
+    "git", "gh",
+    # 开发
+    "python", "pip", "npm", "node", "cargo", "go", "rustc",
+    # 构建
+    "make", "cmake", "gcc", "g++", "clang", "clang++",
+    # 测试
+    "pytest", "nose", "unittest", "jest", "mocha",
+})
+
+def _validate_command(command: str) -> tuple[bool, str]:
+    """验证命令是否在白名单中"""
+    parts = shlex.split(command)
+    if not parts:
+        return False, "Empty command"
+    
+    cmd = Path(parts[0]).name
+    
+    if cmd not in _COMMAND_WHITELIST:
+        return False, f"Command '{cmd}' not in whitelist"
+    
+    # 检查危险模式
+    dangerous_patterns = [
+        r';\s*rm\s',   # ; rm
+        r'&&\s*rm\s',  # && rm
+        r'\|\s*rm\s',  # | rm
+        r'>\s*/dev/',  # > /dev/
+    ]
+    
+    for pattern in dangerous_patterns:
+        if re.search(pattern, command):
+            return False, f"Dangerous pattern detected"
+    
+    return True, ""
+```
+
+---
+
+## 16. TUI 渲染器实现
+
+### 16.1 节流渲染器
+
+```python
+class _ThrottledRenderer:
+    """节流渲染，减少闪烁和 CPU 占用"""
+    
+    def __init__(self, render_fn: Callable, min_interval: float = 0.016):
+        self.render = render_fn
+        self.min_interval = min_interval  # 16ms ≈ 60fps
+        self._pending = False
+        self._last_render = 0.0
+        self._lock = threading.Lock()
+    
+    def request(self) -> None:
+        """请求渲染（可能被合并）"""
+        with self._lock:
+            if not self._pending:
+                self._pending = True
+                threading.Timer(self.min_interval, self._do_render).start()
+    
+    def _do_render(self) -> None:
+        """实际执行渲染"""
+        with self._lock:
+            self._pending = False
+            self._last_render = time.time()
+        self.render()
+    
+    def flush(self) -> None:
+        """立即刷新待处理的渲染"""
+        with self._lock:
+            if self._pending:
+                self._pending = False
+                self._last_render = time.time()
+        self.render()
+```
+
+### 16.2 Markdown 渲染
+
+```python
+def _render_markdown(text: str, width: int, indent: int = 0) -> list[str]:
+    """将 Markdown 转换为 ANSI 控制序列"""
+    lines = []
+    in_code_block = False
+    
+    for line in text.split("\n"):
+        # 代码块处理
+        if line.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        
+        if in_code_block:
+            lines.append(f"\x1b[2m  {line}\x1b[0m")  # dim 灰色
+            continue
+        
+        # 处理格式标记
+        line = re.sub(r'\*\*(.+?)\*\*', r'\x1b[1m\1\x1b[0m', line)  # bold
+        line = re.sub(r'`([^`]+)`', r'\x1b[36m\1\x1b[0m', line)      # cyan
+        line = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\x1b[34m\1\x1b[0m', line)  # blue link
+        
+        # 标题
+        if line.startswith("# "):
+            line = f"\x1b[1m\x1b[4m{line[2:]}\x1b[0m"
+        
+        lines.append(" " * indent + line)
+    
+    return lines
+```
+
+### 16.3 输入事件解析
+
+```python
+def parse_input_chunk(chunk: str) -> ParsedInputEvent:
+    """解析输入块为事件序列"""
+    events = []
+    rest = ""
+    
+    i = 0
+    while i < len(chunk):
+        char = chunk[i]
+        
+        # ESC 序列（方向键、功能键）
+        if char == '\x1b':
+            if i + 1 < len(chunk) and chunk[i + 1] == '[':
+                seq_end = chunk.find('~', i + 2)
+                if seq_end != -1:
+                    events.append(_parse_escape_sequence(chunk[i:seq_end + 1]))
+                    i = seq_end + 1
+                    continue
+        
+        # Ctrl 组合键 (Ctrl+C = 0x03)
+        if char <= '\x1a' and char != '\x1b':
+            events.append(KeyEvent(name=chr(ord(char) + ord('a') - 1), ctrl=True))
+            i += 1
+            continue
+        
+        # 普通字符
+        if char.isprintable() or char == '\n':
+            rest += char
+        
+        i += 1
+    
+    return ParsedInputEvent(events=events, rest=rest)
+```
+
+---
+
+## 17. 核心工具实现示例
+
+### 17.1 read_file 工具
+
+```python
+def read_file(path: str, context: ToolContext, **kwargs) -> ToolResult:
+    """读取文件内容"""
+    safe_path = _safe_path(path, context.cwd)
+    if safe_path is None:
+        return ToolResult(ok=False, output=f"Access denied: {path}")
+    
+    try:
+        # 编码检测
+        for encoding in ['utf-8', 'latin-1', 'gbk']:
+            try:
+                content = safe_path.read_text(encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        # 大文件截断
+        max_chars = 40_000
+        if len(content) > max_chars:
+            lines = content.split('\n')
+            head_lines = int(max_chars * 0.7 / max(1, len(content) / len(lines)))
+            tail_lines = max(1, max_chars - head_lines)
+            content = (
+                "\n".join(lines[:head_lines])
+                + f"\n\n... [{len(lines) - head_lines - tail_lines} lines omitted] ...\n\n"
+                + "\n".join(lines[-tail_lines:])
+            )
+        
+        return ToolResult(ok=True, output=content)
+    
+    except FileNotFoundError:
+        return ToolResult(ok=False, output=f"File not found: {path}")
+    except PermissionError:
+        return ToolResult(ok=False, output=f"Permission denied: {path}")
+    except Exception as e:
+        return ToolResult(ok=False, output=f"Error reading file: {e}")
+
+
+def _safe_path(path: str, cwd: str) -> Path | None:
+    """安全地解析路径"""
+    try:
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path(cwd) / p
+        p = p.resolve()
+        
+        cwd_resolved = Path(cwd).resolve()
+        if not str(p).startswith(str(cwd_resolved)):
+            return None
+        
+        return p
+    except (OSError, RuntimeError):
+        return None
+```
+
+### 17.2 run_command 工具
+
+```python
+def run_command(
+    command: str,
+    context: ToolContext,
+    timeout: int = 60,
+    **kwargs
+) -> ToolResult:
+    """执行 shell 命令"""
+    # 1. 命令验证
+    if not _validate_command(command):
+        return ToolResult(ok=False, output=f"Command not allowed: {command}")
+    
+    # 2. 权限检查
+    ok, msg = context.permissions.check("run_command", {"command": command}, context)
+    if not ok:
+        return ToolResult(ok=False, output=f"Permission denied: {msg}")
+    
+    try:
+        # 3. 执行
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=context.cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "HOME": os.environ.get("HOME", "/tmp")},
+        )
+        
+        # 4. 超时控制
+        try:
+            output, _ = process.communicate(timeout=timeout)
+            output = output.decode('utf-8', errors='replace')
+        except subprocess.TimeoutExpired:
+            process.kill()
+            output, _ = process.communicate()
+            output = output.decode('utf-8', errors='replace')
+            output += f"\n[Process killed: exceeded {timeout}s timeout]"
+        
+        if process.returncode != 0:
+            output += f"\n[Exit code: {process.returncode}]"
+        
+        return ToolResult(ok=True, output=output)
+    
+    except Exception as e:
+        return ToolResult(ok=False, output=f"Command failed: {e}")
+```
+
+---
+
 ## 12. 简历技术要点
 
 ### 12.1 核心技术亮点详细版
@@ -1992,5 +2583,46 @@ Python, 智能体架构设计, 并发编程, 状态管理, BM25 算法, TUI 开�
 
 ---
 
-*文档版本：2.0（深度扩展版）*
-*最后更新：2026/05/17*
+*文档版本：3.0（完整实现细节版）*
+*最后更新：2026/06/01*
+
+---
+
+## 附录 F：新增实现细节索引
+
+### F.1 Agent Intelligence
+
+| 功能 | 文件:函数 | 位置 |
+|------|----------|------|
+| 错误分类器 | `agent_intelligence.py:ErrorClassifier` | 第 13.1 节 |
+| Nudge 生成器 | `agent_intelligence.py:NudgeGenerator` | 第 13.2 节 |
+| 工具调度器 | `agent_intelligence.py:ToolScheduler` | 第 13.3 节 |
+
+### F.2 MCP 集成
+
+| 功能 | 位置 |
+|------|------|
+| 安全验证层 | 第 14.1 节 |
+| MCP 工具创建 | 第 14.2 节 |
+
+### F.3 权限系统
+
+| 功能 | 位置 |
+|------|------|
+| 路径规范化 | 第 15.1 节 |
+| 命令白名单 | 第 15.2 节 |
+
+### F.4 TUI 渲染器
+
+| 功能 | 位置 |
+|------|------|
+| 节流渲染器 | 第 16.1 节 |
+| Markdown 渲染 | 第 16.2 节 |
+| 输入事件解析 | 第 16.3 节 |
+
+### F.5 核心工具实现
+
+| 功能 | 位置 |
+|------|------|
+| read_file | 第 17.1 节 |
+| run_command | 第 17.2 节 |
